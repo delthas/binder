@@ -14,7 +14,7 @@ int hookDLL(char *dll_path, const PROCESS_INFORMATION *pi) {
   HANDLE hThread = CreateRemoteThread(pi->hProcess, 0, 0, pLoadLibrary, dll_addr, 0, 0);
   
   if (!hThread) {
-    printf("Could not create remote thread [%d].", (int) GetLastError());
+    printf("Could not create remote thread [%d]\n", (int) GetLastError());
     VirtualFreeEx(pi->hProcess, dll_addr, 0, MEM_RELEASE);
     TerminateProcess(pi->hProcess, 1);
     return 6;
@@ -22,51 +22,21 @@ int hookDLL(char *dll_path, const PROCESS_INFORMATION *pi) {
   
   DWORD hookedDLL;
   WaitForSingleObject(hThread, INFINITE);
-  GetExitCodeThread(hThread, &hookedDLL);
+  if(!GetExitCodeThread(hThread, &hookedDLL)) {
+    printf("Exit code failed with [%d]\n", (int) GetLastError());
+    return 7;
+  }
   CloseHandle(hThread);
   
   VirtualFreeEx(pi->hProcess, dll_addr, 0, MEM_RELEASE);
   
   if (!hookedDLL) {
-    printf("Remote thread exited with [%d].", (int) GetLastError());
+    printf("Remote thread exited without handle\n");
     TerminateProcess(pi->hProcess, 1);
-    return 7;
+    return 8;
   }
   
   return 0;
-}
-
-int getBase(HANDLE hnd, void **address, WORD *orig_code) {
-  char imageName[MAX_PATH + 1];
-  DWORD len = GetProcessImageFileNameA(hnd, imageName, sizeof(imageName));
-  if(!len) {
-    printf("Could not get process image file name [%d].", (int) GetLastError());
-    return 9;
-  }
-  imageName[len] = '\0';
-  
-  HMODULE hMods[1024];
-  DWORD cbNeeded;
-  MODULEINFO modInfo;
-  if (EnumProcessModules(hnd, hMods, sizeof(hMods), &cbNeeded)) {
-    for (int i = 0; i < (cbNeeded / sizeof(HMODULE)); i++) {
-      TCHAR szModName[MAX_PATH];
-      if (GetModuleFileNameEx(hnd, hMods[i], szModName, sizeof(szModName) / sizeof(TCHAR))) {
-        if(!strcmp(imageName, szModName)) {
-          continue;
-        }
-        if(!GetModuleInformation(hnd, hMods[i], &modInfo, sizeof(modInfo))) {
-          printf("Could not get module information [%d].", (int) GetLastError());
-          return 10;
-        }
-        *address = modInfo.EntryPoint;
-        ReadProcessMemory(hnd, modInfo.EntryPoint, orig_code, 2, 0);
-        return 0;
-      }
-    }
-  }
-  printf("Could not find executable module [%d].", (int) GetLastError());
-  return 11;
 }
 
 int hook(char *dll_path, char *exe_path, char **args, int argv) {
@@ -80,16 +50,16 @@ int hook(char *dll_path, char *exe_path, char **args, int argv) {
   si.cb = sizeof(si);
   
   if (!GetFileAttributesEx(exe_path, GetFileExInfoStandard, &exe_info)) {
-    printf("Couldn't find exe='%s'\nError [%d].", exe_path, (int) GetLastError());
+    printf("Couldn't find exe='%s'\nError [%d]\n", exe_path, (int) GetLastError());
     return 3;
   }
   
   if (!GetFileAttributesEx(dll_path, GetFileExInfoStandard, &dat_info)) {
-    printf("Couldn't find dll='%s'\nError [%d].", dll_path, (int) GetLastError());
+    printf("Couldn't find dll='%s'\nError [%d]\n", dll_path, (int) GetLastError());
     return 4;
   }
   
-  int length = strlen(exe_path) + 3 + argv;
+  int length = (int) (strlen(exe_path) + 3 + argv);
   for (int i = 0; i < argv; ++i) {
     length += strlen(args[i]);
   }
@@ -113,54 +83,24 @@ int hook(char *dll_path, char *exe_path, char **args, int argv) {
   _splitpath_s(exe_path, NULL, 0, dir, sizeof(dir), NULL, 0, NULL, 0);
   
   if (!CreateProcessA(0, command, 0, 0, TRUE, CREATE_SUSPENDED, 0, dir, &si, &pi)) {
-    printf("exe='%s'\ndir='%s'\nCould not create process [%d].", exe_path, dir, (int) GetLastError());
+    printf("exe='%s'\ndir='%s'\nCould not create process [%d]\n", exe_path, dir, (int) GetLastError());
     return 5;
   }
   
-  // Wait for process startup, block
-  WORD lock_code = 0xFEEB;
-  WORD orig_code;
-  void *address;
-  int res = getBase(pi.hProcess, &address, &orig_code);
-  if(!res) {
+  int res = hookDLL(dll_path, &pi);
+  if (res) {
     return res;
   }
-  
-  WriteProcessMemory(pi.hProcess, address, (char *) &lock_code, 2, 0);
-  
-  CONTEXT ct;
-  ct.ContextFlags = CONTEXT_CONTROL;
-  int tries = 0;
-  do {
-    ResumeThread(pi.hThread);
-    Sleep(10);
-    SuspendThread(pi.hThread);
-    
-    if (!GetThreadContext(pi.hThread, &ct)) {
-      if (tries++ < 500)
-        continue;
-      Sleep(100);
-      TerminateProcess(pi.hProcess, 1);
-      return 8;
-    }
-  } while (ct.Eip != address);
-  
-  res = hookDLL(dll_path, &pi);
-  if (!res)
-    return res;
-  
-  WriteProcessMemory(pi.hProcess, address, (char *) &orig_code, 2, 0);
-  FlushInstructionCache(pi.hProcess, address, 2);
   ResumeThread(pi.hThread);
   
   return 0;
 }
 
 int main(int argc, char *argv[]) {
-  if (argc < 2) {
-    printf("Syntax: <dll_path> <exe_path> [exe_arg1 [...]]");
+  if (argc < 3) {
+    printf("Syntax: <dll_path> <exe_path> [exe_arg1 [...]]\n");
     return 1;
   }
   
-  return hook(argv[0], argv[1], &argv[2], argc - 2);
+  return hook(argv[1], argv[2], &argv[3], argc - 3);
 }
